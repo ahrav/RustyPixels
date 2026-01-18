@@ -1,0 +1,8 @@
+[package]
+name = "rusty-pixels"
+version = "0.1.0"
+edition = "2024"
+
+# [[bin]]
+# name = "benchmark_op_rotate_image"
+# path = "src/bin/benchmark_op_rotate_image.rs"
