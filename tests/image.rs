@@ -28,8 +28,8 @@ fn fill_pattern(image: &mut Image) {
         for x in 0..width {
             let base = ((y * width + x) * channels) as u16;
             let pixel = image.pixel_mut(x, y);
-            for c in 0..channels {
-                pixel[c] = base + c as u16;
+            for (c, sample) in pixel.iter_mut().enumerate().take(channels) {
+                *sample = base + c as u16;
             }
         }
     }
@@ -163,7 +163,7 @@ fn test_fill_u8_sets_pixels() {
     img.fill_u8(1, 2, 3, 4);
     let alpha = 4u16 * 257;
     let expected = [
-        premultiply_sample(1u16 * 257, alpha),
+        premultiply_sample(257, alpha),
         premultiply_sample(2u16 * 257, alpha),
         premultiply_sample(3u16 * 257, alpha),
         alpha,
@@ -180,7 +180,7 @@ fn test_fill_u8_sets_pixels() {
 fn test_fill_u8_non_premultiplied() {
     let mut img = Image::with_premultiplied(2, 2, ImageFormat::Rgba, false);
     img.fill_u8(1, 2, 3, 4);
-    let expected = [1u16 * 257, 2u16 * 257, 3u16 * 257, 4u16 * 257];
+    let expected = [257u16, 2 * 257, 3 * 257, 4 * 257];
 
     for y in 0..2 {
         for x in 0..2 {
