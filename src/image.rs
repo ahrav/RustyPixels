@@ -590,8 +590,12 @@ impl Image {
     }
 
     /// Fills all pixels with 8-bit RGBA values.
+    /// When the image is premultiplied, RGB values are scaled by alpha.
     pub fn fill_u8(&mut self, r: u8, g: u8, b: u8, a: u8) {
-        let samples = convert_u8_to_sample(r, g, b, a);
+        let mut samples = convert_u8_to_sample(r, g, b, a);
+        if self.is_premultiplied {
+            premultiply_rgba_samples(&mut samples);
+        }
         let color = Color::new(samples, self.format);
         self.fill_with_color(&color);
     }
@@ -691,4 +695,14 @@ pub fn convert_u8_to_sample(r: u8, g: u8, b: u8, a: u8) -> [Sample; 4] {
         (b as Sample) * 257,
         (a as Sample) * 257,
     ]
+}
+
+fn premultiply_rgba_samples(samples: &mut [Sample; 4]) {
+    let alpha = samples[3];
+    if alpha < MAX_VALUE {
+        let blend = alpha as f32 / MAX_VALUE as f32;
+        for channel in &mut samples[..3] {
+            *channel = (*channel as f32 * blend) as Sample;
+        }
+    }
 }
