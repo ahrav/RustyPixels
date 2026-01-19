@@ -226,7 +226,9 @@ impl ImageBuffer {
     pub(crate) fn as_slice(&self) -> &[Sample] {
         match self {
             ImageBuffer::Vec(data) => data.as_slice(),
-            ImageBuffer::Mmap { ptr, len, .. } => unsafe { slice::from_raw_parts(ptr.as_ptr(), *len) },
+            ImageBuffer::Mmap { ptr, len, .. } => unsafe {
+                slice::from_raw_parts(ptr.as_ptr(), *len)
+            },
         }
     }
 
@@ -290,11 +292,7 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
 #[cfg(target_os = "linux")]
 fn page_size() -> usize {
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if size > 0 {
-        size as usize
-    } else {
-        4096
-    }
+    if size > 0 { size as usize } else { 4096 }
 }
 
 #[cfg(target_os = "macos")]
@@ -412,7 +410,10 @@ impl Clone for Image {
             self.is_premultiplied,
             self.allocation,
         );
-        cloned.data.as_mut_slice().copy_from_slice(self.data.as_slice());
+        cloned
+            .data
+            .as_mut_slice()
+            .copy_from_slice(self.data.as_slice());
         cloned
     }
 }
