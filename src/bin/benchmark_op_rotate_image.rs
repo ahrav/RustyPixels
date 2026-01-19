@@ -12,6 +12,13 @@
 //! For Linux Docker setup, perf counters, and huge page checks, see
 //! `docs/linux-docker-benchmarks.md`.
 //!
+//! # Notes
+//!
+//! - Timings measure the rotation kernel with preallocated input/output buffers.
+//! - Hardware counters are Linux-only and best-effort; they require perf_event
+//!   permissions and are zeroed on other platforms.
+//! - Linux runs also request transparent huge pages when available.
+//!
 //! # Benchmark Categories
 //!
 //! - **Size**: Scaling behavior from 256×256 to 4096×4096 (RGB, 45°)

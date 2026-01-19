@@ -1,3 +1,10 @@
+//! Criterion benchmarks for `OpRotateImage`.
+//!
+//! Focuses on rotation kernel cost by reusing preallocated output buffers.
+//! Covers size scaling, format differences, and fast-path (90/180/270 deg) vs
+//! bicubic interpolation. For detailed metrics or Linux perf counters, use
+//! `cargo run --bin benchmark_op_rotate_image`.
+
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rusty_pixels::{Image, ImageFormat, OpRotateImage, RotateDirection, bench_utils};
 

@@ -28,6 +28,7 @@ pub const MAX_VALUE_8_BIT: u8 = u8::MAX;
 
 /// Pixel format describing the number and meaning of channels.
 ///
+/// Channels are interleaved per pixel (no planar layout or subsampling).
 /// Channel counts: `None`=0, `Gray`=1, `GrayAlpha`=2, `Rgb`/`YCbCr`=3, `Rgba`/`YCbCrA`=4.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -67,7 +68,8 @@ impl ImageFormat {
 ///
 /// The default uses huge pages on macOS/Linux and standard pages elsewhere.
 /// `HugePages` is best-effort: it falls back to standard pages if the OS
-/// cannot satisfy the request.
+/// cannot satisfy the request. On other platforms, `HugePages` behaves like
+/// `Standard`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImageAllocation {
     Standard,
@@ -95,6 +97,7 @@ fn compute_stride(width: usize, format: ImageFormat) -> usize {
     let channels = format.channel_count();
     let base_stride = width.saturating_mul(channels);
     let bytes_per_row = base_stride.saturating_mul(std::mem::size_of::<Sample>());
+    // Add padding for large power-of-two rows to reduce cache set conflicts.
     if bytes_per_row >= 8192 && bytes_per_row.is_power_of_two() {
         base_stride.saturating_add(64)
     } else {
@@ -464,7 +467,10 @@ fn try_huge_pages(_len: usize) -> Option<ImageBuffer> {
 /// Pixel data is stored contiguously: `data[y * stride + x * channels + c]` where
 /// `stride` is the per-row sample stride (may include padding). This layout is
 /// cache-friendly for row-wise traversal.
+/// Stride may be padded to avoid large power-of-two row sizes, so do not assume
+/// `stride == width * channels`.
 /// Buffer allocation can be configured to use OS huge pages when available.
+/// Huge page support is best-effort and only enabled on macOS/Linux.
 ///
 /// # Premultiplied Alpha
 ///
