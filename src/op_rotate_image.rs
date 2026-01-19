@@ -23,17 +23,17 @@ use crate::op_orient_90::{OpOrient90Increments, Orientation90};
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use core::arch::aarch64::{
-    float32x4_t, vcvtq_f32_u32, vdupq_n_f32, vld1_u16, vmaxq_f32, vminq_f32, vmlaq_n_f32,
-    vmovl_u16, vmulq_n_f32, vst1q_f32,
+    float32x4_t, vcvtq_f32_u32, vcvtq_u32_f32, vdupq_n_f32, vld1_u16, vmaxq_f32, vminq_f32,
+    vmlaq_n_f32, vmovl_u16, vmovn_u32, vmulq_n_f32, vst1_u16,
 };
 
 const ERROR_RANGE: f32 = 10e-5_f32;
 
 /// Tile size for cache-efficient processing.
 ///
-/// Processing in 48×48 tiles keeps the working set small enough to fit in L1/L2
+/// Processing in 32×32 tiles keeps the working set small enough to fit in L1/L2
 /// cache, reducing memory bandwidth for large images.
-const K_TILE: usize = 48;
+const K_TILE: usize = 32;
 
 /// Halo size for bicubic interpolation at image edges.
 ///
@@ -70,6 +70,33 @@ struct SpanContext<'a> {
     transform: &'a SpanTransform,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RotateScratch {
+    row_x_start: Vec<i32>,
+    row_x_end: Vec<i32>,
+    row_inner_start: Vec<i32>,
+    row_inner_end: Vec<i32>,
+}
+
+impl RotateScratch {
+    fn reserve(&mut self, len: usize) {
+        if self.row_x_start.len() < len {
+            self.row_x_start.resize(len, -1);
+            self.row_x_end.resize(len, -1);
+            self.row_inner_start.resize(len, -1);
+            self.row_inner_end.resize(len, -1);
+        }
+    }
+
+    fn prepare(&mut self, len: usize) {
+        self.reserve(len);
+        self.row_x_start[..len].fill(-1);
+        self.row_x_end[..len].fill(-1);
+        self.row_inner_start[..len].fill(-1);
+        self.row_inner_end[..len].fill(-1);
+    }
+}
+
 /// Direction of rotation.
 ///
 /// - `Cw`: Clockwise rotation (positive angle rotates top toward right)
@@ -104,6 +131,7 @@ pub struct OpRotateImage {
     background_externally_set: bool,
     use_op_orient: bool,
     orientation: Orientation90,
+    scratch: RotateScratch,
 }
 
 impl Default for OpRotateImage {
@@ -121,6 +149,7 @@ impl OpRotateImage {
             background_externally_set: false,
             use_op_orient: false,
             orientation: Orientation90::Up,
+            scratch: RotateScratch::default(),
         }
     }
 
@@ -162,6 +191,14 @@ impl OpRotateImage {
     pub fn set_background_color(&mut self, r: u8, g: u8, b: u8, a: u8) -> &mut Self {
         self.background_samples = convert_u8_to_sample(r, g, b, a);
         self.background_externally_set = true;
+        self
+    }
+
+    /// Reserves internal scratch buffers to avoid per-call allocations.
+    ///
+    /// Call after computing output dimensions if you want to keep the hot path allocation-free.
+    pub fn reserve_scratch(&mut self, output_height: usize) -> &mut Self {
+        self.scratch.reserve(output_height);
         self
     }
 
@@ -327,7 +364,7 @@ impl OpRotateImage {
         }
     }
 
-    fn process_pixels(&self, src: &Image, dst: &mut Image, tf: &[f32; 9]) {
+    fn process_pixels(&mut self, src: &Image, dst: &mut Image, tf: &[f32; 9]) {
         let new_width = dst.width();
         let new_height = dst.height();
         let channels = dst.channels();
@@ -387,43 +424,57 @@ impl OpRotateImage {
         ];
 
         let new_width_i = new_width as i32;
-        let mut row_x_start = vec![-1_i32; new_height];
-        let mut row_x_end = vec![-1_i32; new_height];
-        let mut row_inner_start = vec![-1_i32; new_height];
-        let mut row_inner_end = vec![-1_i32; new_height];
-
-        for new_y in 0..new_height {
-            let y = new_y as f32;
-            if let Some((x0, x1)) = scanline_range(&outer_poly, y, new_width_i, true) {
-                row_x_start[new_y] = x0;
-                row_x_end[new_y] = x1;
-            }
-        }
-
-        if interior_max_x >= interior_min_x && interior_max_y >= interior_min_y {
-            let inner_poly = [
-                to_output(interior_min_x, interior_min_y),
-                to_output(interior_max_x, interior_min_y),
-                to_output(interior_max_x, interior_max_y),
-                to_output(interior_min_x, interior_max_y),
-            ];
+        self.scratch.prepare(new_height);
+        {
+            let RotateScratch {
+                row_x_start,
+                row_x_end,
+                row_inner_start,
+                row_inner_end,
+            } = &mut self.scratch;
+            let row_x_start = &mut row_x_start[..new_height];
+            let row_x_end = &mut row_x_end[..new_height];
+            let row_inner_start = &mut row_inner_start[..new_height];
+            let row_inner_end = &mut row_inner_end[..new_height];
 
             for new_y in 0..new_height {
                 let y = new_y as f32;
-                if let Some((x0, x1)) = scanline_range(&inner_poly, y, new_width_i, false) {
-                    row_inner_start[new_y] = x0;
-                    row_inner_end[new_y] = x1;
+                if let Some((x0, x1)) = scanline_range(&outer_poly, y, new_width_i, true) {
+                    row_x_start[new_y] = x0;
+                    row_x_end[new_y] = x1;
+                }
+            }
+
+            if interior_max_x >= interior_min_x && interior_max_y >= interior_min_y {
+                let inner_poly = [
+                    to_output(interior_min_x, interior_min_y),
+                    to_output(interior_max_x, interior_min_y),
+                    to_output(interior_max_x, interior_max_y),
+                    to_output(interior_min_x, interior_max_y),
+                ];
+
+                for new_y in 0..new_height {
+                    let y = new_y as f32;
+                    if let Some((x0, x1)) = scanline_range(&inner_poly, y, new_width_i, false) {
+                        row_inner_start[new_y] = x0;
+                        row_inner_end[new_y] = x1;
+                    }
                 }
             }
         }
+
+        let row_x_start = &self.scratch.row_x_start[..new_height];
+        let row_x_end = &self.scratch.row_x_end[..new_height];
+        let row_inner_start = &self.scratch.row_inner_start[..new_height];
+        let row_inner_end = &self.scratch.row_inner_end[..new_height];
 
         let dst_data = dst.data.as_mut_slice();
 
         for tile_y in (0..new_height).step_by(K_TILE) {
             let y_end = (tile_y + K_TILE).min(new_height);
-            let mut row_offsets = Vec::with_capacity(y_end - tile_y);
-            for new_y in tile_y..y_end {
-                row_offsets.push(new_y * dst_stride);
+            let mut row_offsets = [0usize; K_TILE];
+            for (idx, new_y) in (tile_y..y_end).enumerate() {
+                row_offsets[idx] = new_y * dst_stride;
             }
 
             for tile_x in (0..new_width).step_by(K_TILE) {
@@ -516,8 +567,18 @@ impl OpRotateImage {
         let cx_start = span_start as f32 + half_width_offset;
         let mut old_x = m00 * cx_start + m01 * cy + m02 + original_width_offset;
         let mut old_y = m10 * cx_start + m11 * cy + m12 + original_height_offset;
-        let mut dst_index = row_offset + span_start * channels;
+        if channels == 4 {
+            let mut dst_ptr = unsafe { dst_data.as_mut_ptr().add(row_offset + span_start * 4) };
+            for _ in span_start..span_end {
+                self.paint_image_cubic_rgba_ptr(src, old_x, old_y, dst_ptr);
+                dst_ptr = unsafe { dst_ptr.add(4) };
+                old_x += m00;
+                old_y += m10;
+            }
+            return;
+        }
 
+        let mut dst_index = row_offset + span_start * channels;
         for _ in span_start..span_end {
             let dst_pixel = &mut dst_data[dst_index..dst_index + channels];
             self.paint_image_cubic(src, old_x, old_y, dst_pixel);
@@ -559,19 +620,18 @@ impl OpRotateImage {
         let cx_start = span_start as f32 + half_width_offset;
         let mut old_x = m00 * cx_start + m01 * cy + m02 + original_width_offset;
         let mut old_y = m10 * cx_start + m11 * cy + m12 + original_height_offset;
-        let mut dst_index = row_offset + span_start * channels;
-
         if channels == 4 {
+            let mut dst_ptr = unsafe { dst_data.as_mut_ptr().add(row_offset + span_start * 4) };
             for _ in span_start..span_end {
-                let dst_pixel = &mut dst_data[dst_index..dst_index + 4];
-                self.paint_image_cubic_interior_rgba(src, old_x, old_y, dst_pixel);
-                dst_index += 4;
+                self.paint_image_cubic_interior_rgba_ptr(src, old_x, old_y, dst_ptr);
+                dst_ptr = unsafe { dst_ptr.add(4) };
                 old_x += m00;
                 old_y += m10;
             }
             return;
         }
 
+        let mut dst_index = row_offset + span_start * channels;
         for _ in span_start..span_end {
             let dst_pixel = &mut dst_data[dst_index..dst_index + channels];
             self.paint_image_cubic_interior(src, old_x, old_y, dst_pixel);
@@ -581,6 +641,7 @@ impl OpRotateImage {
         }
     }
 
+    #[inline(always)]
     fn paint_image_cubic_interior_rgba(
         &self,
         src: &Image,
@@ -659,8 +720,90 @@ impl OpRotateImage {
         dst_pixel[3] = results[3] as Sample;
     }
 
+    #[inline(always)]
+    fn paint_image_cubic_interior_rgba_ptr(
+        &self,
+        src: &Image,
+        orig_x: f32,
+        orig_y: f32,
+        dst_ptr: *mut Sample,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            self.paint_image_cubic_interior_rgba_neon_ptr(src, orig_x, orig_y, dst_ptr);
+        }
+
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            self.paint_image_cubic_interior_rgba_scalar_ptr(src, orig_x, orig_y, dst_ptr);
+        }
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    #[inline(always)]
+    fn paint_image_cubic_interior_rgba_scalar_ptr(
+        &self,
+        src: &Image,
+        orig_x: f32,
+        orig_y: f32,
+        dst_ptr: *mut Sample,
+    ) {
+        let pc_x = orig_x as i32;
+        let pc_y = orig_y as i32;
+
+        let wx = get_cubic_weights(orig_x - pc_x as f32);
+        let wy = get_cubic_weights(orig_y - pc_y as f32);
+
+        let start_x = pc_x - 1;
+        let start_y = pc_y - 1;
+        let stride = src.stride();
+        let row0 = (start_y as usize) * stride + (start_x as usize) * 4;
+        let row1 = row0 + stride;
+        let row2 = row1 + stride;
+        let row3 = row2 + stride;
+
+        let max_val = MAX_VALUE as f32;
+        let data = &src.data;
+
+        let mut results = [0.0_f32; 4];
+        for c in 0..4 {
+            let col0 = data[row0 + c] as f32 * wx[0]
+                + data[row0 + c + 4] as f32 * wx[1]
+                + data[row0 + c + 8] as f32 * wx[2]
+                + data[row0 + c + 12] as f32 * wx[3];
+            let col1 = data[row1 + c] as f32 * wx[0]
+                + data[row1 + c + 4] as f32 * wx[1]
+                + data[row1 + c + 8] as f32 * wx[2]
+                + data[row1 + c + 12] as f32 * wx[3];
+            let col2 = data[row2 + c] as f32 * wx[0]
+                + data[row2 + c + 4] as f32 * wx[1]
+                + data[row2 + c + 8] as f32 * wx[2]
+                + data[row2 + c + 12] as f32 * wx[3];
+            let col3 = data[row3 + c] as f32 * wx[0]
+                + data[row3 + c + 4] as f32 * wx[1]
+                + data[row3 + c + 8] as f32 * wx[2]
+                + data[row3 + c + 12] as f32 * wx[3];
+
+            let mut final_val = col0 * wy[0] + col1 * wy[1] + col2 * wy[2] + col3 * wy[3];
+            if final_val < 0.0 {
+                final_val = 0.0;
+            }
+            if final_val > max_val {
+                final_val = max_val;
+            }
+            results[c] = final_val;
+        }
+
+        unsafe {
+            *dst_ptr.add(0) = results[0] as Sample;
+            *dst_ptr.add(1) = results[1] as Sample;
+            *dst_ptr.add(2) = results[2] as Sample;
+            *dst_ptr.add(3) = results[3] as Sample;
+        }
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    #[inline]
+    #[inline(always)]
     unsafe fn paint_image_cubic_interior_rgba_neon(
         &self,
         src: &Image,
@@ -682,7 +825,6 @@ impl OpRotateImage {
         let row2 = row1 + stride;
         let row3 = row2 + stride;
 
-        let mut out = [0.0_f32; 4];
         unsafe {
             let data = &src.data;
             let col0 = Self::row_cubic_rgba_neon(data, row0, &wx);
@@ -700,16 +842,60 @@ impl OpRotateImage {
             final_val = vmaxq_f32(final_val, zero);
             final_val = vminq_f32(final_val, max_val);
 
-            vst1q_f32(out.as_mut_ptr(), final_val);
+            let out_u32 = vcvtq_u32_f32(final_val);
+            let out_u16 = vmovn_u32(out_u32);
+            vst1_u16(dst_pixel.as_mut_ptr(), out_u16);
         }
-        dst_pixel[0] = out[0] as Sample;
-        dst_pixel[1] = out[1] as Sample;
-        dst_pixel[2] = out[2] as Sample;
-        dst_pixel[3] = out[3] as Sample;
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    #[inline]
+    #[inline(always)]
+    unsafe fn paint_image_cubic_interior_rgba_neon_ptr(
+        &self,
+        src: &Image,
+        orig_x: f32,
+        orig_y: f32,
+        dst_ptr: *mut Sample,
+    ) {
+        let pc_x = orig_x as i32;
+        let pc_y = orig_y as i32;
+
+        let wx = get_cubic_weights(orig_x - pc_x as f32);
+        let wy = get_cubic_weights(orig_y - pc_y as f32);
+
+        let start_x = pc_x - 1;
+        let start_y = pc_y - 1;
+        let stride = src.stride();
+        let row0 = (start_y as usize) * stride + (start_x as usize) * 4;
+        let row1 = row0 + stride;
+        let row2 = row1 + stride;
+        let row3 = row2 + stride;
+
+        unsafe {
+            let data = &src.data;
+            let col0 = Self::row_cubic_rgba_neon(data, row0, &wx);
+            let col1 = Self::row_cubic_rgba_neon(data, row1, &wx);
+            let col2 = Self::row_cubic_rgba_neon(data, row2, &wx);
+            let col3 = Self::row_cubic_rgba_neon(data, row3, &wx);
+
+            let mut final_val = vmulq_n_f32(col0, wy[0]);
+            final_val = vmlaq_n_f32(final_val, col1, wy[1]);
+            final_val = vmlaq_n_f32(final_val, col2, wy[2]);
+            final_val = vmlaq_n_f32(final_val, col3, wy[3]);
+
+            let zero = vdupq_n_f32(0.0);
+            let max_val = vdupq_n_f32(MAX_VALUE as f32);
+            final_val = vmaxq_f32(final_val, zero);
+            final_val = vminq_f32(final_val, max_val);
+
+            let out_u32 = vcvtq_u32_f32(final_val);
+            let out_u16 = vmovn_u32(out_u32);
+            vst1_u16(dst_ptr, out_u16);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[inline(always)]
     unsafe fn row_cubic_rgba_neon(data: &[Sample], row_base: usize, wx: &[f32; 4]) -> float32x4_t {
         unsafe {
             let p0 = Self::load_rgba_f32x4_neon(data, row_base);
@@ -725,7 +911,7 @@ impl OpRotateImage {
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    #[inline]
+    #[inline(always)]
     unsafe fn load_rgba_f32x4_neon(data: &[Sample], index: usize) -> float32x4_t {
         unsafe {
             let samples_u16 = vld1_u16(data.as_ptr().add(index));
@@ -734,6 +920,7 @@ impl OpRotateImage {
         }
     }
 
+    #[inline(always)]
     fn paint_image_cubic_interior(
         &self,
         src: &Image,
@@ -867,6 +1054,102 @@ impl OpRotateImage {
         }
     }
 
+    #[inline(always)]
+    fn paint_image_cubic_rgba_ptr(
+        &self,
+        src: &Image,
+        orig_x: f32,
+        orig_y: f32,
+        dst_ptr: *mut Sample,
+    ) {
+        let pc_x = orig_x.floor() as i32;
+        let pc_y = orig_y.floor() as i32;
+
+        let w = src.width() as i32;
+        let h = src.height() as i32;
+        if pc_x < -2 || pc_x > w || pc_y < -2 || pc_y > h {
+            return;
+        }
+
+        let start_x = pc_x - 1;
+        let start_y = pc_y - 1;
+        let in_bounds = start_x >= 0 && start_y >= 0 && start_x + 3 < w && start_y + 3 < h;
+        if in_bounds {
+            self.paint_image_cubic_interior_rgba_ptr(src, orig_x, orig_y, dst_ptr);
+            return;
+        }
+
+        let wx = get_cubic_weights(orig_x - pc_x as f32);
+        let wy = get_cubic_weights(orig_y - pc_y as f32);
+        let max_val = MAX_VALUE as f32;
+        let patch = self.get_image_patch(src, pc_x, pc_y);
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            let patch_ptr = patch.as_ptr() as *const Sample;
+            let patch_data = core::slice::from_raw_parts(patch_ptr, 64);
+            let col0 = Self::row_cubic_rgba_neon(patch_data, 0, &wx);
+            let col1 = Self::row_cubic_rgba_neon(patch_data, 16, &wx);
+            let col2 = Self::row_cubic_rgba_neon(patch_data, 32, &wx);
+            let col3 = Self::row_cubic_rgba_neon(patch_data, 48, &wx);
+
+            let mut final_val = vmulq_n_f32(col0, wy[0]);
+            final_val = vmlaq_n_f32(final_val, col1, wy[1]);
+            final_val = vmlaq_n_f32(final_val, col2, wy[2]);
+            final_val = vmlaq_n_f32(final_val, col3, wy[3]);
+
+            let zero = vdupq_n_f32(0.0);
+            let max_val = vdupq_n_f32(max_val);
+            final_val = vmaxq_f32(final_val, zero);
+            final_val = vminq_f32(final_val, max_val);
+
+            let out_u32 = vcvtq_u32_f32(final_val);
+            let out_u16 = vmovn_u32(out_u32);
+            vst1_u16(dst_ptr, out_u16);
+            return;
+        }
+
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            let mut results = [0.0_f32; 4];
+            for c in 0..4 {
+                let col0 = patch[0][0][c] as f32 * wx[0]
+                    + patch[0][1][c] as f32 * wx[1]
+                    + patch[0][2][c] as f32 * wx[2]
+                    + patch[0][3][c] as f32 * wx[3];
+                let col1 = patch[1][0][c] as f32 * wx[0]
+                    + patch[1][1][c] as f32 * wx[1]
+                    + patch[1][2][c] as f32 * wx[2]
+                    + patch[1][3][c] as f32 * wx[3];
+                let col2 = patch[2][0][c] as f32 * wx[0]
+                    + patch[2][1][c] as f32 * wx[1]
+                    + patch[2][2][c] as f32 * wx[2]
+                    + patch[2][3][c] as f32 * wx[3];
+                let col3 = patch[3][0][c] as f32 * wx[0]
+                    + patch[3][1][c] as f32 * wx[1]
+                    + patch[3][2][c] as f32 * wx[2]
+                    + patch[3][3][c] as f32 * wx[3];
+
+                let mut final_val = col0 * wy[0] + col1 * wy[1] + col2 * wy[2] + col3 * wy[3];
+                if final_val < 0.0 {
+                    final_val = 0.0;
+                }
+                if final_val > max_val {
+                    final_val = max_val;
+                }
+                results[c] = final_val;
+            }
+
+            unsafe {
+                *dst_ptr.add(0) = results[0] as Sample;
+                *dst_ptr.add(1) = results[1] as Sample;
+                *dst_ptr.add(2) = results[2] as Sample;
+                *dst_ptr.add(3) = results[3] as Sample;
+            }
+        }
+    }
+
+    #[inline(always)]
     fn paint_image_cubic(&self, src: &Image, orig_x: f32, orig_y: f32, dst_pixel: &mut [Sample]) {
         let pc_x = orig_x.floor() as i32;
         let pc_y = orig_y.floor() as i32;
@@ -877,10 +1160,83 @@ impl OpRotateImage {
             return;
         }
 
+        let start_x = pc_x - 1;
+        let start_y = pc_y - 1;
+        let in_bounds = start_x >= 0 && start_y >= 0 && start_x + 3 < w && start_y + 3 < h;
+        if in_bounds {
+            if dst_pixel.len() == 4 {
+                self.paint_image_cubic_interior_rgba(src, orig_x, orig_y, dst_pixel);
+            } else {
+                self.paint_image_cubic_interior(src, orig_x, orig_y, dst_pixel);
+            }
+            return;
+        }
+
         let wx = get_cubic_weights(orig_x - pc_x as f32);
         let wy = get_cubic_weights(orig_y - pc_y as f32);
-        let patch = self.get_image_patch(src, pc_x, pc_y);
         let max_val = MAX_VALUE as f32;
+
+        if dst_pixel.len() == 4 {
+            let patch = self.get_image_patch(src, pc_x, pc_y);
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            unsafe {
+                let patch_ptr = patch.as_ptr() as *const Sample;
+                let patch_data = core::slice::from_raw_parts(patch_ptr, 64);
+                let col0 = Self::row_cubic_rgba_neon(patch_data, 0, &wx);
+                let col1 = Self::row_cubic_rgba_neon(patch_data, 16, &wx);
+                let col2 = Self::row_cubic_rgba_neon(patch_data, 32, &wx);
+                let col3 = Self::row_cubic_rgba_neon(patch_data, 48, &wx);
+
+                let mut final_val = vmulq_n_f32(col0, wy[0]);
+                final_val = vmlaq_n_f32(final_val, col1, wy[1]);
+                final_val = vmlaq_n_f32(final_val, col2, wy[2]);
+                final_val = vmlaq_n_f32(final_val, col3, wy[3]);
+
+                let zero = vdupq_n_f32(0.0);
+                let max_val = vdupq_n_f32(max_val);
+                final_val = vmaxq_f32(final_val, zero);
+                final_val = vminq_f32(final_val, max_val);
+
+                let out_u32 = vcvtq_u32_f32(final_val);
+                let out_u16 = vmovn_u32(out_u32);
+                vst1_u16(dst_pixel.as_mut_ptr(), out_u16);
+                return;
+            }
+
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+            {
+                for (c, dst_value) in dst_pixel.iter_mut().enumerate() {
+                    let col0 = patch[0][0][c] as f32 * wx[0]
+                        + patch[0][1][c] as f32 * wx[1]
+                        + patch[0][2][c] as f32 * wx[2]
+                        + patch[0][3][c] as f32 * wx[3];
+                    let col1 = patch[1][0][c] as f32 * wx[0]
+                        + patch[1][1][c] as f32 * wx[1]
+                        + patch[1][2][c] as f32 * wx[2]
+                        + patch[1][3][c] as f32 * wx[3];
+                    let col2 = patch[2][0][c] as f32 * wx[0]
+                        + patch[2][1][c] as f32 * wx[1]
+                        + patch[2][2][c] as f32 * wx[2]
+                        + patch[2][3][c] as f32 * wx[3];
+                    let col3 = patch[3][0][c] as f32 * wx[0]
+                        + patch[3][1][c] as f32 * wx[1]
+                        + patch[3][2][c] as f32 * wx[2]
+                        + patch[3][3][c] as f32 * wx[3];
+
+                    let mut final_val = col0 * wy[0] + col1 * wy[1] + col2 * wy[2] + col3 * wy[3];
+                    if final_val < 0.0 {
+                        final_val = 0.0;
+                    }
+                    if final_val > max_val {
+                        final_val = max_val;
+                    }
+                    *dst_value = final_val as Sample;
+                }
+                return;
+            }
+        }
+
+        let patch = self.get_image_patch(src, pc_x, pc_y);
 
         for (c, dst_value) in dst_pixel.iter_mut().enumerate() {
             let col0 = patch[0][0][c] as f32 * wx[0]
@@ -911,6 +1267,7 @@ impl OpRotateImage {
         }
     }
 
+    #[inline(always)]
     fn get_image_patch(&self, image: &Image, x: i32, y: i32) -> [[[Sample; 4]; 4]; 4] {
         let mut patch = [[[0; 4]; 4]; 4];
         let w = image.width() as i32;
@@ -1153,6 +1510,7 @@ fn scanline_range(
 /// Given `t` in [0, 1), returns weights for the 4 samples in a 1D neighborhood
 /// centered at the integer position. The weights sum to 1.0 and produce a smooth
 /// C1-continuous interpolation curve.
+#[inline(always)]
 fn get_cubic_weights(t: f32) -> [f32; 4] {
     let t2 = t * t;
     let t3 = t2 * t;

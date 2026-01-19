@@ -8,7 +8,7 @@
 //! data[y * stride + x * channels + c]
 //! ```
 //!
-//! where `stride = width * channels`.
+//! where `stride` is the per-row sample stride (may include padding).
 
 use std::cmp;
 use std::fmt;
@@ -88,6 +88,17 @@ impl ImageAllocation {
     /// Alias for `Default::default()`.
     pub fn platform_default() -> Self {
         Self::default()
+    }
+}
+
+fn compute_stride(width: usize, format: ImageFormat) -> usize {
+    let channels = format.channel_count();
+    let base_stride = width.saturating_mul(channels);
+    let bytes_per_row = base_stride.saturating_mul(std::mem::size_of::<Sample>());
+    if bytes_per_row >= 8192 && bytes_per_row.is_power_of_two() {
+        base_stride.saturating_add(64)
+    } else {
+        base_stride
     }
 }
 
@@ -204,6 +215,10 @@ pub(crate) enum ImageBuffer {
         len: usize,
         bytes: usize,
     },
+    Aligned {
+        ptr: NonNull<Sample>,
+        len: usize,
+    },
 }
 
 impl ImageBuffer {
@@ -229,6 +244,9 @@ impl ImageBuffer {
             ImageBuffer::Mmap { ptr, len, .. } => unsafe {
                 slice::from_raw_parts(ptr.as_ptr(), *len)
             },
+            ImageBuffer::Aligned { ptr, len, .. } => unsafe {
+                slice::from_raw_parts(ptr.as_ptr(), *len)
+            },
         }
     }
 
@@ -236,6 +254,9 @@ impl ImageBuffer {
         match self {
             ImageBuffer::Vec(data) => data.as_mut_slice(),
             ImageBuffer::Mmap { ptr, len, .. } => unsafe {
+                slice::from_raw_parts_mut(ptr.as_ptr(), *len)
+            },
+            ImageBuffer::Aligned { ptr, len, .. } => unsafe {
                 slice::from_raw_parts_mut(ptr.as_ptr(), *len)
             },
         }
@@ -274,6 +295,12 @@ impl Drop for ImageBuffer {
             #[cfg(target_os = "linux")]
             unsafe {
                 libc::munmap(ptr.as_ptr() as *mut libc::c_void, *bytes);
+            }
+        }
+        if let ImageBuffer::Aligned { ptr, .. } = self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            unsafe {
+                libc::free(ptr.as_ptr() as *mut libc::c_void);
             }
         }
     }
@@ -367,6 +394,26 @@ fn try_huge_pages(len: usize) -> Option<ImageBuffer> {
     if byte_len < HUGE_PAGE_MIN_BYTES {
         return None;
     }
+
+    let alloc_bytes = align_up(byte_len, HUGE_PAGE_MIN_BYTES)?;
+    let mut raw: *mut libc::c_void = std::ptr::null_mut();
+    let ret = unsafe { libc::posix_memalign(&mut raw, HUGE_PAGE_MIN_BYTES, alloc_bytes) };
+    if ret == 0 && !raw.is_null() {
+        unsafe {
+            libc::madvise(raw, alloc_bytes, libc::MADV_HUGEPAGE);
+        }
+        let ptr = match NonNull::new(raw as *mut Sample) {
+            Some(ptr) => ptr,
+            None => {
+                unsafe {
+                    libc::free(raw);
+                }
+                return None;
+            }
+        };
+        return Some(ImageBuffer::Aligned { ptr, len });
+    }
+
     let alloc_bytes = align_up(byte_len, page_size())?;
     let map_ptr = unsafe {
         libc::mmap(
@@ -410,7 +457,8 @@ fn try_huge_pages(_len: usize) -> Option<ImageBuffer> {
 /// # Memory Layout
 ///
 /// Pixel data is stored contiguously: `data[y * stride + x * channels + c]` where
-/// `stride = width * channels`. This layout is cache-friendly for row-wise traversal.
+/// `stride` is the per-row sample stride (may include padding). This layout is
+/// cache-friendly for row-wise traversal.
 /// Buffer allocation can be configured to use OS huge pages when available.
 ///
 /// # Premultiplied Alpha
@@ -422,6 +470,7 @@ fn try_huge_pages(_len: usize) -> Option<ImageBuffer> {
 pub struct Image {
     width: usize,
     height: usize,
+    stride: usize,
     format: ImageFormat,
     is_premultiplied: bool,
     allocation: ImageAllocation,
@@ -457,6 +506,7 @@ impl Image {
         Self {
             width: 0,
             height: 0,
+            stride: 0,
             format: ImageFormat::None,
             is_premultiplied: true,
             allocation: ImageAllocation::default(),
@@ -509,11 +559,12 @@ impl Image {
         is_premultiplied: bool,
         allocation: ImageAllocation,
     ) -> Self {
-        let channels = format.channel_count();
-        let len = width.saturating_mul(height).saturating_mul(channels);
+        let stride = compute_stride(width, format);
+        let len = height.saturating_mul(stride);
         Self {
             width,
             height,
+            stride,
             format,
             is_premultiplied,
             allocation,
@@ -524,6 +575,53 @@ impl Image {
     /// Resets the image to new dimensions and format, reallocating if needed.
     pub fn reset(&mut self, width: usize, height: usize, format: ImageFormat) {
         let allocation = self.allocation;
+        let stride = compute_stride(width, format);
+        let len = height.saturating_mul(stride);
+        let mut reused = false;
+
+        match &mut self.data {
+            ImageBuffer::Vec(data) => {
+                data.resize(len, 0);
+                data.as_mut_slice().fill(0);
+                reused = true;
+            }
+            ImageBuffer::Mmap {
+                ptr,
+                len: current_len,
+                ..
+            } => {
+                if *current_len >= len {
+                    *current_len = len;
+                    unsafe {
+                        slice::from_raw_parts_mut(ptr.as_ptr(), *current_len).fill(0);
+                    }
+                    reused = true;
+                }
+            }
+            ImageBuffer::Aligned {
+                ptr,
+                len: current_len,
+                ..
+            } => {
+                if *current_len >= len {
+                    *current_len = len;
+                    unsafe {
+                        slice::from_raw_parts_mut(ptr.as_ptr(), *current_len).fill(0);
+                    }
+                    reused = true;
+                }
+            }
+        }
+
+        if reused {
+            self.width = width;
+            self.height = height;
+            self.stride = stride;
+            self.format = format;
+            self.is_premultiplied = true;
+            return;
+        }
+
         *self = Self::with_premultiplied_and_allocation(width, height, format, true, allocation);
     }
 
@@ -535,6 +633,23 @@ impl Image {
     /// Returns the allocation strategy.
     pub fn allocation(&self) -> ImageAllocation {
         self.allocation
+    }
+
+    /// Hints the kernel to back the buffer with transparent huge pages when available.
+    #[cfg(target_os = "linux")]
+    pub fn advise_hugepage(&self) {
+        let data = self.data.as_slice();
+        if data.is_empty() {
+            return;
+        }
+        let bytes = std::mem::size_of_val(data);
+        unsafe {
+            libc::madvise(
+                data.as_ptr() as *mut libc::c_void,
+                bytes,
+                libc::MADV_HUGEPAGE,
+            );
+        }
     }
 
     /// Returns true if the format has an alpha channel.
@@ -562,9 +677,9 @@ impl Image {
         self.format.channel_count()
     }
 
-    /// Returns the row stride in samples (width * channels).
+    /// Returns the row stride in samples (may include padding).
     pub fn stride(&self) -> usize {
-        self.width * self.channels()
+        self.stride
     }
 
     /// Returns the samples for row `y`.

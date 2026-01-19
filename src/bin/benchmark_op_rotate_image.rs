@@ -581,7 +581,6 @@ fn read_scaled_counter(fd: RawFd) -> u64 {
     scaled as u64
 }
 
-#[cfg(target_os = "linux")]
 fn parse_u64_base0(input: &str) -> Option<u64> {
     let value = input.trim();
     if value.is_empty() {
@@ -1051,6 +1050,12 @@ impl BenchmarkSuite {
             let (out_w, out_h) = rotate.compute_output_dimensions(&input.borrow());
             let premul = input.borrow().is_premultiplied();
             *output.borrow_mut() = Image::with_premultiplied(out_w, out_h, format, premul);
+            rotate.reserve_scratch(out_h);
+            #[cfg(target_os = "linux")]
+            {
+                input.borrow().advise_hugepage();
+                output.borrow().advise_hugepage();
+            }
         };
 
         let bench = || {
