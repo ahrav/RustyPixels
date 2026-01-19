@@ -1051,6 +1051,12 @@ impl BenchmarkSuite {
             let (out_w, out_h) = rotate.compute_output_dimensions(&input.borrow());
             let premul = input.borrow().is_premultiplied();
             *output.borrow_mut() = Image::with_premultiplied(out_w, out_h, format, premul);
+            rotate.reserve_scratch(out_h);
+            #[cfg(target_os = "linux")]
+            {
+                input.borrow().advise_hugepage();
+                output.borrow().advise_hugepage();
+            }
         };
 
         let bench = || {
