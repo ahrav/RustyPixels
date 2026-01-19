@@ -215,6 +215,7 @@ pub(crate) enum ImageBuffer {
         len: usize,
         bytes: usize,
     },
+    #[cfg(target_os = "linux")]
     Aligned {
         ptr: NonNull<Sample>,
         len: usize,
@@ -244,6 +245,7 @@ impl ImageBuffer {
             ImageBuffer::Mmap { ptr, len, .. } => unsafe {
                 slice::from_raw_parts(ptr.as_ptr(), *len)
             },
+            #[cfg(target_os = "linux")]
             ImageBuffer::Aligned { ptr, len, .. } => unsafe {
                 slice::from_raw_parts(ptr.as_ptr(), *len)
             },
@@ -256,6 +258,7 @@ impl ImageBuffer {
             ImageBuffer::Mmap { ptr, len, .. } => unsafe {
                 slice::from_raw_parts_mut(ptr.as_ptr(), *len)
             },
+            #[cfg(target_os = "linux")]
             ImageBuffer::Aligned { ptr, len, .. } => unsafe {
                 slice::from_raw_parts_mut(ptr.as_ptr(), *len)
             },
@@ -297,8 +300,8 @@ impl Drop for ImageBuffer {
                 libc::munmap(ptr.as_ptr() as *mut libc::c_void, *bytes);
             }
         }
+        #[cfg(target_os = "linux")]
         if let ImageBuffer::Aligned { ptr, .. } = self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             unsafe {
                 libc::free(ptr.as_ptr() as *mut libc::c_void);
             }
@@ -599,6 +602,7 @@ impl Image {
                     reused = true;
                 }
             }
+            #[cfg(target_os = "linux")]
             ImageBuffer::Aligned {
                 ptr,
                 len: current_len,
