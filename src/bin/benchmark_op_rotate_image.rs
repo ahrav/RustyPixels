@@ -581,6 +581,7 @@ fn read_scaled_counter(fd: RawFd) -> u64 {
     scaled as u64
 }
 
+#[cfg(target_os = "linux")]
 fn parse_u64_base0(input: &str) -> Option<u64> {
     let value = input.trim();
     if value.is_empty() {
