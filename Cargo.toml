@@ -6,3 +6,13 @@ edition = "2024"
 # [[bin]]
 # name = "benchmark_op_rotate_image"
 # path = "src/bin/benchmark_op_rotate_image.rs"
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "op_rotate_image"
+harness = false
