@@ -293,17 +293,6 @@ impl HardwareCounters {
             return HardwareCounterSnapshot::default();
         }
 
-        let mut snapshot = HardwareCounterSnapshot::default();
-        snapshot.l1_cache_misses = read_scaled_counter(self.l1_cache_misses) as usize;
-        snapshot.l2_cache_misses = read_scaled_counter(self.l2_cache_misses) as usize;
-        snapshot.l3_cache_misses = read_scaled_counter(self.l3_cache_misses) as usize;
-        snapshot.tlb_misses = read_scaled_counter(self.tlb_misses) as usize;
-        snapshot.branch_misses = read_scaled_counter(self.branch_misses) as usize;
-        snapshot.cpu_cycles = read_scaled_counter(self.cpu_cycles) as usize;
-        snapshot.instructions = read_scaled_counter(self.instructions) as usize;
-        snapshot.stalled_cycles_frontend =
-            read_scaled_counter(self.stalled_cycles_frontend) as usize;
-
         let mut stalled_backend = read_scaled_counter(self.stalled_cycles_backend);
         if stalled_backend == 0 {
             let raw = read_scaled_counter(self.stalled_backend_raw);
@@ -311,11 +300,19 @@ impl HardwareCounters {
                 stalled_backend = raw;
             }
         }
-        snapshot.stalled_cycles_backend = stalled_backend as usize;
-        snapshot.stalled_cycles_backend_mem =
-            read_scaled_counter(self.stalled_backend_mem) as usize;
 
-        snapshot
+        HardwareCounterSnapshot {
+            l1_cache_misses: read_scaled_counter(self.l1_cache_misses) as usize,
+            l2_cache_misses: read_scaled_counter(self.l2_cache_misses) as usize,
+            l3_cache_misses: read_scaled_counter(self.l3_cache_misses) as usize,
+            tlb_misses: read_scaled_counter(self.tlb_misses) as usize,
+            branch_misses: read_scaled_counter(self.branch_misses) as usize,
+            cpu_cycles: read_scaled_counter(self.cpu_cycles) as usize,
+            instructions: read_scaled_counter(self.instructions) as usize,
+            stalled_cycles_frontend: read_scaled_counter(self.stalled_cycles_frontend) as usize,
+            stalled_cycles_backend: stalled_backend as usize,
+            stalled_cycles_backend_mem: read_scaled_counter(self.stalled_backend_mem) as usize,
+        }
     }
 
     fn disabled() -> Self {
@@ -463,8 +460,6 @@ const IOC_NRBITS: u64 = 8;
 const IOC_TYPEBITS: u64 = 8;
 #[cfg(target_os = "linux")]
 const IOC_SIZEBITS: u64 = 14;
-#[cfg(target_os = "linux")]
-const IOC_DIRBITS: u64 = 2;
 
 #[cfg(target_os = "linux")]
 const IOC_NRSHIFT: u64 = 0;
