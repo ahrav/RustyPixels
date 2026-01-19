@@ -400,6 +400,7 @@ fn try_huge_pages(len: usize) -> Option<ImageBuffer> {
     let ret = unsafe { libc::posix_memalign(&mut raw, HUGE_PAGE_MIN_BYTES, alloc_bytes) };
     if ret == 0 && !raw.is_null() {
         unsafe {
+            std::ptr::write_bytes(raw as *mut u8, 0, byte_len);
             libc::madvise(raw, alloc_bytes, libc::MADV_HUGEPAGE);
         }
         let ptr = match NonNull::new(raw as *mut Sample) {
