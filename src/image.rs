@@ -203,14 +203,7 @@ pub(crate) enum ImageBuffer {
         ptr: NonNull<Sample>,
         len: usize,
         bytes: usize,
-        dealloc: MmapDealloc,
     },
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum MmapDealloc {
-    Munmap,
-    VmDeallocate,
 }
 
 impl ImageBuffer {
@@ -351,7 +344,12 @@ fn try_huge_pages(len: usize) -> Option<ImageBuffer> {
         Some(ptr) => ptr,
         None => {
             unsafe {
-                libc::munmap(map_ptr, alloc_bytes);
+                #[allow(deprecated)]
+                libc::vm_deallocate(
+                    libc::mach_task_self(),
+                    address as libc::vm_address_t,
+                    alloc_bytes as libc::vm_size_t,
+                );
             }
             return None;
         }
