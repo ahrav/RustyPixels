@@ -33,7 +33,7 @@ const ERROR_RANGE: f32 = 10e-5_f32;
 ///
 /// Processing in 32×32 tiles keeps the working set small enough to fit in L1/L2
 /// cache, reducing memory bandwidth for large images.
-const K_TILE: usize = 32;
+const K_TILE: usize = 64;
 
 /// Halo size for bicubic interpolation at image edges.
 ///
