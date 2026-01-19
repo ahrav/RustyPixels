@@ -2,21 +2,28 @@
 //!
 //! # Algorithm Overview
 //!
-//! 1. **Fast-path detection**: Exact 90°/180°/270° angles delegate to
+//! 1. **Fast-path detection**: Exact 90/180/270 degree angles delegate to
 //!    [`OpOrient90Increments`] for simple coordinate remapping.
 //!
-//! 2. **Tiled processing**: The output is processed in 48×48 tiles (`K_TILE`)
-//!    to maximize L1/L2 cache utilization.
+//! 2. **Bounds + inverse mapping**: Rotated source corners define output size,
+//!    and output pixels are mapped back into source space around the image center
+//!    to avoid holes.
 //!
-//! 3. **Scanline clipping**: For each output row, polygon intersection determines
+//! 3. **Tiled processing**: The output is processed in 64x64 tiles (`K_TILE`)
+//!    to improve cache locality.
+//!
+//! 4. **Scanline clipping**: For each output row, polygon intersection determines
 //!    the x-range that maps to valid source pixels, skipping background-only regions.
 //!
-//! 4. **Interior/border split**: Pixels fully inside the source image use an
+//! 5. **Interior/border split**: Pixels fully inside the source image use an
 //!    optimized path that skips bounds checking. Border pixels use a slower path
 //!    with boundary handling.
 //!
-//! 5. **Bicubic interpolation**: Uses Catmull-Rom-style cubic weights over a
-//!    4×4 pixel neighborhood for smooth results.
+//! 6. **Bicubic interpolation**: Uses Catmull-Rom-style cubic weights over a
+//!    4x4 pixel neighborhood for smooth results.
+//!
+//! On aarch64 with NEON, the RGBA interior path uses a vectorized kernel; other
+//! platforms use the scalar implementation.
 
 use crate::image::{Color, Image, MAX_VALUE, Sample, convert_u8_to_sample};
 use crate::op_orient_90::{OpOrient90Increments, Orientation90};
@@ -31,8 +38,8 @@ const ERROR_RANGE: f32 = 10e-5_f32;
 
 /// Tile size for cache-efficient processing.
 ///
-/// Processing in 32×32 tiles keeps the working set small enough to fit in L1/L2
-/// cache, reducing memory bandwidth for large images.
+/// Processing in 64x64 tiles keeps the working set small for the 4x4 kernel
+/// while limiting per-tile overhead.
 const K_TILE: usize = 64;
 
 /// Halo size for bicubic interpolation at image edges.
@@ -229,6 +236,7 @@ impl OpRotateImage {
         self.process_pixels(img, &mut new_image, &tf);
 
         let mod_val = self.angle % (std::f32::consts::PI / 4.0);
+        // For 45-degree multiples, rounding can add a 1px border; trim it.
         if mod_val.abs() < ERROR_RANGE && new_image.width() > 2 && new_image.height() > 2 {
             new_image.crop(1, 1, new_image.width() - 2, new_image.height() - 2)
         } else {
