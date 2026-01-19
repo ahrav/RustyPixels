@@ -14,6 +14,6 @@ libc = "0.2"
 criterion = "0.5"
 proptest = "1"
 
-# [[bench]]
-# name = "op_rotate_image"
-# harness = false
+[[bench]]
+name = "op_rotate_image"
+harness = false
