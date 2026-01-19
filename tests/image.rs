@@ -277,7 +277,9 @@ fn test_crop_full_returns_clone() {
     assert_eq!(cropped.is_premultiplied(), img.is_premultiplied());
     assert_eq!(cropped.allocation(), img.allocation());
 
-    cropped.pixel_mut(0, 0).copy_from_slice(&[999, 998, 997, 996]);
+    cropped
+        .pixel_mut(0, 0)
+        .copy_from_slice(&[999, 998, 997, 996]);
     assert_eq!(img.pixel(0, 0), original.as_slice());
 }
 
