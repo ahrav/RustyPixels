@@ -1106,7 +1106,6 @@ impl OpRotateImage {
             let out_u32 = vcvtq_u32_f32(final_val);
             let out_u16 = vmovn_u32(out_u32);
             vst1_u16(dst_ptr, out_u16);
-            return;
         }
 
         #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
