@@ -203,7 +203,14 @@ pub(crate) enum ImageBuffer {
         ptr: NonNull<Sample>,
         len: usize,
         bytes: usize,
+        dealloc: MmapDealloc,
     },
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum MmapDealloc {
+    Munmap,
+    VmDeallocate,
 }
 
 impl ImageBuffer {
@@ -265,7 +272,13 @@ impl fmt::Debug for ImageBuffer {
 impl Drop for ImageBuffer {
     fn drop(&mut self) {
         if let ImageBuffer::Mmap { ptr, bytes, .. } = self {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            unsafe {
+                #[allow(deprecated)]
+                let task = libc::mach_task_self();
+                libc::vm_deallocate(task, ptr.as_ptr() as libc::vm_address_t, *bytes);
+            }
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::munmap(ptr.as_ptr() as *mut libc::c_void, *bytes);
             }
@@ -296,7 +309,13 @@ fn page_size() -> usize {
 }
 
 #[cfg(target_os = "macos")]
-const VM_FLAGS_SUPERPAGE_SIZE_2MB: libc::c_int = 0x00020000;
+const VM_FLAGS_SUPERPAGE_SIZE_ANY: libc::c_int = 0x00010000;
+
+#[cfg(target_os = "macos")]
+const VM_FLAGS_ANYWHERE: libc::c_int = 0x00000001;
+
+#[cfg(target_os = "macos")]
+const VM_INHERIT_DEFAULT: libc::vm_inherit_t = 1;
 
 #[cfg(target_os = "macos")]
 fn try_huge_pages(len: usize) -> Option<ImageBuffer> {
@@ -305,20 +324,30 @@ fn try_huge_pages(len: usize) -> Option<ImageBuffer> {
         return None;
     }
     let alloc_bytes = align_up(byte_len, HUGE_PAGE_MIN_BYTES)?;
-    let map_ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            alloc_bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            VM_FLAGS_SUPERPAGE_SIZE_2MB,
+    let mut address: libc::mach_vm_address_t = 0;
+    let mask = (HUGE_PAGE_MIN_BYTES - 1) as libc::mach_vm_offset_t;
+    let prot = libc::VM_PROT_READ | libc::VM_PROT_WRITE;
+    let flags = VM_FLAGS_ANYWHERE | VM_FLAGS_SUPERPAGE_SIZE_ANY;
+    let kr = unsafe {
+        #[allow(deprecated)]
+        libc::mach_vm_map(
+            libc::mach_task_self(),
+            &mut address,
+            alloc_bytes as libc::mach_vm_size_t,
+            mask,
+            flags,
+            libc::MEMORY_OBJECT_NULL as libc::mem_entry_name_port_t,
             0,
+            0,
+            prot,
+            prot,
+            VM_INHERIT_DEFAULT,
         )
     };
-    if map_ptr == libc::MAP_FAILED {
+    if kr != 0 {
         return None;
     }
-    let ptr = match NonNull::new(map_ptr as *mut Sample) {
+    let ptr = match NonNull::new(address as *mut Sample) {
         Some(ptr) => ptr,
         None => {
             unsafe {
