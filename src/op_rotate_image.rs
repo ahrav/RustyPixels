@@ -132,22 +132,25 @@ impl OpRotateImage {
     pub fn set_rotation(&mut self, angle_degrees: f32, direction: RotateDirection) -> &mut Self {
         let mut angle = self.normalize_angle(angle_degrees);
 
+        self.direction = direction;
+        if self.direction == RotateDirection::Ccw {
+            angle = -angle;
+        }
+
         let angle_as_int = angle as i32;
         if angle_as_int % 90 == 0 {
             self.use_op_orient = true;
             self.orientation = match angle_as_int {
                 90 => Orientation90::Right,
-                180 => Orientation90::Down,
+                180 | -180 => Orientation90::Down,
                 -90 => Orientation90::Left,
                 _ => Orientation90::Up,
             };
+        } else {
+            self.use_op_orient = false;
         }
 
         angle = angle * std::f32::consts::PI / 180.0;
-        self.direction = direction;
-        if self.direction == RotateDirection::Ccw {
-            angle = -angle;
-        }
         self.angle = angle;
         self
     }
@@ -1211,6 +1214,28 @@ mod tests {
         let actual = 405.0_f32;
         let result = rotate.normalize_angle(actual);
         assert_close_pct(expected, result, 0.01);
+    }
+
+    #[test]
+    fn test_fast_path_direction_affects_orientation() {
+        let mut rotate = OpRotateImage::new();
+        rotate.set_rotation(90.0, RotateDirection::Cw);
+        assert!(rotate.use_op_orient);
+        assert_eq!(rotate.orientation, Orientation90::Right);
+
+        rotate.set_rotation(90.0, RotateDirection::Ccw);
+        assert!(rotate.use_op_orient);
+        assert_eq!(rotate.orientation, Orientation90::Left);
+    }
+
+    #[test]
+    fn test_fast_path_disabled_on_non_right_angle() {
+        let mut rotate = OpRotateImage::new();
+        rotate.set_rotation(90.0, RotateDirection::Cw);
+        assert!(rotate.use_op_orient);
+
+        rotate.set_rotation(45.0, RotateDirection::Cw);
+        assert!(!rotate.use_op_orient);
     }
 
     #[test]
